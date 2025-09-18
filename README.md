@@ -51,59 +51,99 @@ High-level flow from recording to distribution for the Week-1 MVP:
 - Observe: Prometheus scrapes metrics; Grafana dashboards track health and throughput.
 
 ```mermaid
-flowchart LR
-  subgraph Client
-    U[User]
-    WRTC[WebRTC Capture]
-  end
-
-  subgraph API[Express API]
-    PRESIGN[Presigned Upload]
-    META[Save Asset Metadata]
-    KPROD[Kafka Producer]
-  end
-
-  subgraph Infra
-    S3[(S3/MinIO)]
-    PG[(PostgreSQL)]
-    REDIS[(Redis)]
-    K[Kafka]
-  end
-
-  subgraph Workers
-    ING[Ingest Handler]
-    FFMPEG[FFmpeg Transcoder]
-    WHISP[Whisper Transcriber]
-  end
-
-  subgraph Observability
-    PROM[Prometheus]
-    GRAF[Grafana]
-  end
-
-  U -->|Signaling| WRTC -->|Offers/Answers| API
-  U -->|Request Presign| PRESIGN --> S3
-  U -->|Upload Media| S3
-
-  PRESIGN --> META --> PG
-  META --> KPROD --> K
-
-  K --> ING -->|validate object| S3
-  ING -->|enqueue| K
-  K --> FFMPEG -->|derivatives| S3
-  FFMPEG -->|status update| PG
-
-  FFMPEG -->|optional enqueue| K --> WHISP
-  WHISP -->|transcripts| S3
-  WHISP -->|status update| PG
-
-  API -. metrics .-> PROM
-  FFMPEG -. metrics .-> PROM
-  WHISP -. metrics .-> PROM
-  PROM --> GRAF
-
-  classDef optional fill:#eef,stroke:#88f,stroke-width:1px;
-  WHISP:::optional
+graph TB
+    subgraph "Client Layer"
+        A[Web App] 
+        B[Mobile App]
+        C[Desktop App]
+    end
+    
+    subgraph "Load Balancer & Gateway"
+        D[Load Balancer]
+        E[API Gateway]
+    end
+    
+    subgraph "Core Services"
+        F[User Service]
+        G[Recording Service]
+        H[Media Processing]
+        I[Distribution Service]
+        J[Analytics Service]
+    end
+    
+    subgraph "Real-time Layer"
+        K[WebRTC Server]
+        L[Socket.IO Server]
+    end
+    
+    subgraph "Message Queue"
+        M[Apache Kafka]
+        N[Processing Workers]
+    end
+    
+    subgraph "AI Services"
+        O[OpenAI API]
+        P[Whisper Transcription]
+        Q[Content Generation]
+    end
+    
+    subgraph "Data Layer"
+        R[PostgreSQL]
+        S[Redis Cache]
+        T[AWS S3]
+        U[CloudFront CDN]
+    end
+    
+    subgraph "External Platforms"
+        V[Spotify API]
+        W[Apple Podcasts]
+        X[YouTube API]
+    end
+    
+    subgraph "Monitoring"
+        Y[Prometheus]
+        Z[Grafana]
+    end
+    
+    A --> D
+    B --> D
+    C --> D
+    D --> E
+    E --> F
+    E --> G
+    E --> H
+    E --> I
+    E --> J
+    
+    G --> K
+    G --> L
+    
+    H --> M
+    M --> N
+    N --> O
+    N --> P
+    N --> Q
+    
+    F --> R
+    G --> R
+    H --> R
+    I --> R
+    J --> R
+    
+    F --> S
+    G --> S
+    
+    H --> T
+    T --> U
+    
+    I --> V
+    I --> W
+    I --> X
+    
+    F --> Y
+    G --> Y
+    H --> Y
+    Y --> Z
 ```
 
 ## Repository Structure (proposed)
