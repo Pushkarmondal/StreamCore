@@ -6,3 +6,265 @@ datasource db {
   provider = "postgresql"
   url      = env("DATABASE_URL")
 }
+
+// User management and authentication
+model User {
+  id        String   @id @default(cuid())
+  email     String   @unique
+  username  String   @unique
+  name      String?
+  avatar    String?
+  role      UserRole @default(USER)
+  
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  
+  // Relations
+  projects  Project[]
+  sessions  Session[]
+  
+  @@map("users")
+}
+
+enum UserRole {
+  USER
+  ADMIN
+  MODERATOR
+}
+
+// Project/Podcast management
+model Project {
+  id          String  @id @default(cuid())
+  name        String
+  description String?
+  slug        String  @unique
+  coverArt    String? // S3/MinIO URL
+  
+  // Podcast metadata
+  category    String?
+  language    String  @default("en")
+  explicit    Boolean @default(false)
+  
+  // Distribution settings
+  rssEnabled  Boolean @default(true)
+  
+  ownerId     String
+  owner       User    @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+  
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  
+  // Relations
+  sessions    Session[]
+  episodes    Episode[]
+  
+  @@map("projects")
+}
+
+// Recording sessions (live recordings)
+model Session {
+  id          String        @id @default(cuid())
+  name        String
+  status      SessionStatus @default(PENDING)
+  
+  // WebRTC/Recording metadata
+  roomId      String        @unique
+  maxParticipants Int       @default(10)
+  
+  // Timing
+  scheduledAt DateTime?
+  startedAt   DateTime?
+  endedAt     DateTime?
+  duration    Int?          // seconds
+  
+  projectId   String
+  project     Project       @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  
+  hostId      String
+  host        User          @relation(fields: [hostId], references: [id])
+  
+  createdAt   DateTime      @default(now())
+  updatedAt   DateTime      @updatedAt
+  
+  // Relations
+  recordings  Recording[]
+  episodes    Episode[]
+  
+  @@map("sessions")
+}
+
+enum SessionStatus {
+  PENDING
+  LIVE
+  ENDED
+  PROCESSING
+  COMPLETED
+  FAILED
+}
+
+// Individual recordings from participants
+model Recording {
+  id          String          @id @default(cuid())
+  participantId String        // User ID or anonymous identifier
+  participantName String?
+  
+  // File metadata
+  fileName    String
+  originalUrl String          // S3/MinIO URL to original file
+  fileSize    BigInt
+  mimeType    String
+  duration    Int?            // seconds
+  
+  // Processing status
+  status      RecordingStatus @default(UPLOADED)
+  
+  sessionId   String
+  session     Session         @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  
+  createdAt   DateTime        @default(now())
+  updatedAt   DateTime        @updatedAt
+  
+  // Relations
+  mediaAssets MediaAsset[]
+  
+  @@map("recordings")
+}
+
+enum RecordingStatus {
+  UPLOADED
+  PROCESSING
+  PROCESSED
+  FAILED
+}
+
+// Processed media files (transcoded versions)
+model MediaAsset {
+  id          String     @id @default(cuid())
+  type        AssetType
+  
+  // File details
+  fileName    String
+  url         String     // S3/MinIO URL
+  fileSize    BigInt
+  mimeType    String
+  
+  // Media properties
+  duration    Int?       // seconds
+  bitrate     Int?       // kbps
+  sampleRate  Int?       // Hz (audio)
+  resolution  String?    // "1920x1080" (video)
+  
+  // Processing metadata
+  processedAt DateTime   @default(now())
+  
+  recordingId String
+  recording   Recording  @relation(fields: [recordingId], references: [id], onDelete: Cascade)
+  
+  @@map("media_assets")
+}
+
+enum AssetType {
+  AUDIO_MP3
+  AUDIO_WAV
+  AUDIO_AAC
+  VIDEO_MP4
+  VIDEO_WEBM
+  THUMBNAIL
+}
+
+// Final podcast episodes
+model Episode {
+  id          String        @id @default(cuid())
+  title       String
+  description String?
+  episodeNumber Int?
+  
+  // Episode metadata
+  duration    Int?          // seconds
+  fileSize    BigInt?
+  publishedAt DateTime?
+  
+  // Media files
+  audioUrl    String?       // Final mixed audio
+  videoUrl    String?       // Final mixed video
+  thumbnailUrl String?
+  
+  // AI-generated content
+  showNotes   String?       // Markdown
+  transcript  String?       // Full transcript
+  summary     String?       // AI summary
+  chapters    Json?         // Chapter markers with timestamps
+  
+  // Distribution
+  status      EpisodeStatus @default(DRAFT)
+  
+  projectId   String
+  project     Project       @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  
+  sessionId   String?
+  session     Session?      @relation(fields: [sessionId], references: [id])
+  
+  createdAt   DateTime      @default(now())
+  updatedAt   DateTime      @updatedAt
+  
+  @@map("episodes")
+}
+
+enum EpisodeStatus {
+  DRAFT
+  PROCESSING
+  READY
+  PUBLISHED
+  ARCHIVED
+}
+
+// Processing jobs and queue status
+model ProcessingJob {
+  id          String    @id @default(cuid())
+  type        JobType
+  status      JobStatus @default(PENDING)
+  
+  // Job data
+  payload     Json      // Task-specific data
+  result      Json?     // Processing results
+  errorMessage String?
+  
+  // Queue metadata
+  attempts    Int       @default(0)
+  maxAttempts Int       @default(3)
+  
+  // Timing
+  createdAt   DateTime  @default(now())
+  startedAt   DateTime?
+  completedAt DateTime?
+  
+  @@map("processing_jobs")
+}
+
+enum JobType {
+  MEDIA_TRANSCODE
+  MEDIA_TRANSCRIBE
+  GENERATE_SHOWNOTES
+  GENERATE_THUMBNAIL
+  DISTRIBUTE_RSS
+  DISTRIBUTE_PLATFORM
+}
+
+enum JobStatus {
+  PENDING
+  RUNNING
+  COMPLETED
+  FAILED
+  RETRYING
+}
+
+// System metrics and analytics
+model SystemMetric {
+  id        String   @id @default(cuid())
+  name      String
+  value     Float
+  tags      Json?    // Additional labels/dimensions
+  timestamp DateTime @default(now())
+  
+  @@map("system_metrics")
+}
