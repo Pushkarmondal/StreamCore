@@ -2,7 +2,7 @@
 
 All-in-one backend powering podcast/video recording with AI-generated show notes, automated editing, and cross-platform distribution.
 
-Status: Week-1 MVP planning and scaffolding
+Status: Week-1 MVP — Daily.co recording → FFmpeg processing → S3 distribution
 
 ## One-line pitch
 All-in-one backend powering podcast/video recording with AI-generated show notes, automated editing, and cross-platform distribution.
@@ -16,39 +16,38 @@ All-in-one backend powering podcast/video recording with AI-generated show notes
 - Runtime: Bun 1.0+
 - Framework: Express.js 4.18+ with TypeScript
 - Database: PostgreSQL 15+
-- Cache/Realtime: Redis 7.0+
-- Message Queue: Apache Kafka 3.0+
-- Realtime: Socket.IO + WebRTC (signaling)
-- Media Processing: FFmpeg, WebAssembly (future)
-- AI/ML: OpenAI API, Whisper for transcription
-- Storage: AWS S3 (local: MinIO) + CloudFront CDN (future)
-- Monitoring: Prometheus + Grafana
-- Container: Docker + Docker Compose (local) / Kubernetes (future)
-- CDN/Distribution: RSS + YouTube/Spotify/Apple APIs (future)
+- Queue: BullMQ (Redis 7.0+) for background jobs
+- Recording: Daily.co (cloud recording + webhooks)
+- Media Processing: FFmpeg (worker container)
+- AI/ML: OpenAI Whisper (ASR), GPT-4 for notes/chapters
+- Storage: AWS S3 (local: MinIO) + CloudFront CDN (later)
+- Monitoring: Basic health checks (Prometheus/Grafana optional later)
+- Container: Docker + Docker Compose (local) / Kubernetes (later)
+- Distribution: RSS + YouTube/Spotify/Apple APIs (later)
 
 
 ## Core Services (Week-1 scope)
-- API Gateway/Monolith (Express + TS on Bun) with modular service boundaries
+- API Monolith (Express + TS on Bun)
 - Auth (JWT; stub roles)
-- Project/Session models in PostgreSQL (with Prisma ORM)
-- Socket.IO signaling for WebRTC (no full SFU this week)
-- Upload service to S3/MinIO and pre-signed URLs
-- Kafka topics and producer/consumer skeletons
-- FFmpeg worker container (transcode demo: normalize, mp3/mp4)
-- Whisper transcription call pipeline (stub with real API call behind a flag)
-- Basic Prometheus metrics and health endpoints
+- PostgreSQL models: `User`, `Project`, `Recording`, `Asset`
+- Daily.co wrapper: create/join rooms; recording webhooks handler
+- Storage pipeline: download Daily recording → process → upload to S3/MinIO
+- Job queue: BullMQ (Redis) for processing jobs
+- FFmpeg worker: audio normalize/enhance, multi-resolution video, thumbnails, format conversions
+- AI: Whisper transcription (flag), GPT-4 notes/chapters (flag)
+- Health endpoints and minimal metrics
 
 ## Project Workflow (End-to-End)
 
 High-level flow from recording to distribution for the Week-1 MVP:
 
-- Capture: Clients establish WebRTC via Socket.IO signaling (no SFU this week) and record locally.
-- Upload: Client requests a presigned URL, uploads raw media to S3/MinIO.
-- Ingest: API writes asset metadata to Postgres and enqueues a Kafka `media.ingest` job.
-- Process: Worker validates object in S3, produces a `media.transcode` job, and runs FFmpeg to create derivatives (e.g., mp3/mp4), storing results back to S3 and updating DB status.
-- Transcribe (optional): If `WHISPER_ENABLED=true`, a `media.transcribe` job calls Whisper; transcripts are stored in S3, and DB is updated.
-- Distribute (future): RSS feed generation and platform publishing (Spotify/Apple/YouTube) once assets/transcripts are ready.
-- Observe: Prometheus scrapes metrics; Grafana dashboards track health and throughput.
+- Record: API creates a Daily.co room; users record via Daily's cloud recording.
+- Webhook: Daily.co sends a recording-completed webhook with media URL(s).
+- Ingest: API stores metadata in Postgres and enqueues BullMQ processing jobs.
+- Process: FFmpeg worker downloads the source, normalizes audio, creates multi-res video, extracts audio, generates thumbnails, and writes outputs to S3/MinIO.
+- Transcribe/Notes (optional): Whisper produces transcripts; GPT-4 generates show notes/chapters.
+- Distribute: Expose processed files and transcripts. Future: RSS + platform uploads (YouTube/Spotify/Apple).
+- Monitor: Health checks and basic metrics.
 
 ```mermaid
 graph TB
@@ -183,21 +182,28 @@ graph TB
 - Docker + Docker Compose
 - FFmpeg (optional locally; worker uses container)
 - OpenAI API key (for Whisper/OpenAI features)
+ - Daily.co account + API key (for room creation and webhooks)
 
 ### Quickstart
 1. Clone repository
 2. bun install
 3. Copy `.env.example` to `.env` and fill values
 4. Start infra services:
-   - docker compose -f deployments/docker-compose.yml up -d postgres redis zookeeper kafka minio prometheus grafana
+   - docker compose -f deployments/docker-compose.yml up -d postgres redis minio
 5. Start API locally:
    - bun run dev
+6. Start worker locally (FFmpeg + BullMQ):
+   - bun run worker
 
 ### Environment Variables (.env)
 ```
 # Server
 PORT=4000
 NODE_ENV=development
+
+# Recording (Daily.co)
+DAILY_API_KEY=
+DAILY_WEBHOOK_SECRET=
 
 # Database
 POSTGRES_HOST=localhost
@@ -207,12 +213,8 @@ POSTGRES_USER=streamcore
 POSTGRES_PASSWORD=streamcore
 DATABASE_URL=postgresql://streamcore:streamcore@localhost:5432/streamcore
 
-# Redis
+# Redis (BullMQ)
 REDIS_URL=redis://localhost:6379
-
-# Kafka
-KAFKA_BROKERS=localhost:9092
-KAFKA_CLIENT_ID=streamcore-api
 
 # Storage (MinIO locally)
 S3_ENDPOINT=http://localhost:9000
@@ -225,6 +227,13 @@ S3_FORCE_PATH_STYLE=true
 # AI
 OPENAI_API_KEY=
 WHISPER_ENABLED=false
+GPT_NOTES_ENABLED=false
+
+# YouTube (optional for Day 5)
+YOUTUBE_API_KEY=
+YOUTUBE_CLIENT_ID=
+YOUTUBE_CLIENT_SECRET=
+YOUTUBE_REDIRECT_URI=http://localhost:4000/oauth2/callback
 
 # Monitoring
 PROMETHEUS_METRICS=true
@@ -235,16 +244,18 @@ PROMETHEUS_METRICS=true
 - bun run build: Type-check and build
 - bun run lint: ESLint
 - bun run test: Unit tests (Vitest)
-- bun run worker: Start FFmpeg/Kafka worker
+- bun run worker: Start FFmpeg worker (BullMQ/Redis)
 
 ## API (initial endpoints)
 - GET /health
 - GET /metrics (Prometheus)
 - POST /auth/login (JWT)
 - POST /projects
-- POST /sessions
-- POST /uploads/presign
-- POST /media/transcribe (if WHISPER_ENABLED)
+- POST /recordings/rooms (Daily: create room)
+- POST /webhooks/daily (Daily: recording-completed handler)
+- POST /uploads/presign (optional; if you also support client uploads)
+- POST /media/transcribe (flagged)
+- GET /jobs/:id/status (processing status)
 
 ## Development Notes
 - ORM: Prisma; keep SQL-friendly migrations

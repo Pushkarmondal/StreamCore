@@ -7,7 +7,10 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
-// User management and authentication
+// ============================================================================
+// USER MANAGEMENT & AUTHENTICATION
+// ============================================================================
+
 model User {
   id        String   @id @default(cuid())
   email     String   @unique
@@ -20,8 +23,12 @@ model User {
   updatedAt DateTime @updatedAt
   
   // Relations
-  projects  Project[]
-  sessions  Session[]
+  projects            Project[]
+  sessions            Session[]
+  authSessions        AuthSession[]
+  participantSessions SessionParticipant[]
+  apiKeys             ApiKey[]
+  webhooks            Webhook[]
   
   @@map("users")
 }
@@ -32,44 +39,80 @@ enum UserRole {
   MODERATOR
 }
 
-// Project/Podcast management
+// JWT refresh tokens and active sessions
+model AuthSession {
+  id           String   @id @default(cuid())
+  userId       String
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  
+  token        String   @unique // JWT refresh token (hashed)
+  expiresAt    DateTime
+  ipAddress    String?
+  userAgent    String?
+  
+  createdAt    DateTime @default(now())
+  lastUsedAt   DateTime @default(now())
+  
+  @@index([userId])
+  @@index([expiresAt])
+  @@map("auth_sessions")
+}
+
+// ============================================================================
+// PROJECT/PODCAST MANAGEMENT
+// ============================================================================
+
 model Project {
-  id          String  @id @default(cuid())
+  id          String   @id @default(cuid())
   name        String
   description String?
-  slug        String  @unique
-  coverArt    String? // S3/MinIO URL
+  slug        String   @unique
+  coverArt    String?  // S3/MinIO URL
   
   // Podcast metadata
   category    String?
-  language    String  @default("en")
-  explicit    Boolean @default(false)
+  language    String   @default("en")
+  explicit    Boolean  @default(false)
   
   // Distribution settings
-  rssEnabled  Boolean @default(true)
+  rssEnabled  Boolean  @default(true)
+  rssFeedUrl  String?  // Generated RSS feed URL
   
   ownerId     String
-  owner       User    @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+  owner       User     @relation(fields: [ownerId], references: [id], onDelete: Cascade)
   
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
+  deletedAt   DateTime? // Soft delete
   
   // Relations
   sessions    Session[]
   episodes    Episode[]
   
+  @@index([ownerId])
+  @@index([slug])
   @@map("projects")
 }
 
-// Recording sessions (live recordings)
+// ============================================================================
+// RECORDING SESSIONS
+// ============================================================================
+
 model Session {
   id          String        @id @default(cuid())
   name        String
   status      SessionStatus @default(PENDING)
   
   // WebRTC/Recording metadata
-  roomId      String        @unique
-  maxParticipants Int       @default(10)
+  roomId             String   @unique
+  maxParticipants    Int      @default(10)
+  
+  // Daily.co integration
+  dailyRoomName      String?  @unique
+  dailyRoomUrl       String?
+  dailyRecordingId   String?  @unique
+  dailyMeetingToken  String?
+  recordingConfig    Json?    // Daily.co recording configuration
   
   // Timing
   scheduledAt DateTime?
@@ -87,9 +130,14 @@ model Session {
   updatedAt   DateTime      @updatedAt
   
   // Relations
-  recordings  Recording[]
-  episodes    Episode[]
+  recordings   Recording[]
+  episodes     Episode[]
+  participants SessionParticipant[]
   
+  @@index([projectId, status])
+  @@index([hostId])
+  @@index([startedAt])
+  @@index([dailyRoomName])
   @@map("sessions")
 }
 
@@ -102,10 +150,51 @@ enum SessionStatus {
   FAILED
 }
 
-// Individual recordings from participants
+// Multi-user session participants
+model SessionParticipant {
+  id            String   @id @default(cuid())
+  
+  sessionId     String
+  session       Session  @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  
+  userId        String?
+  user          User?    @relation(fields: [userId], references: [id])
+  
+  // Participant info
+  name          String
+  email         String?
+  role          ParticipantRole @default(GUEST)
+  
+  // Daily.co data
+  dailyParticipantId String?
+  
+  // Session activity
+  joinedAt      DateTime?
+  leftAt        DateTime?
+  speakingTime  Int?     @default(0) // seconds
+  
+  createdAt     DateTime @default(now())
+  
+  @@unique([sessionId, userId])
+  @@index([sessionId])
+  @@index([userId])
+  @@map("session_participants")
+}
+
+enum ParticipantRole {
+  HOST
+  CO_HOST
+  GUEST
+  LISTENER
+}
+
+// ============================================================================
+// RECORDINGS & MEDIA PROCESSING
+// ============================================================================
+
 model Recording {
-  id          String          @id @default(cuid())
-  participantId String        // User ID or anonymous identifier
+  id              String          @id @default(cuid())
+  participantId   String
   participantName String?
   
   // File metadata
@@ -125,8 +214,12 @@ model Recording {
   updatedAt   DateTime        @updatedAt
   
   // Relations
-  mediaAssets MediaAsset[]
+  mediaAssets    MediaAsset[]
+  processingJobs ProcessingJob[]
+  storageFiles   StorageFile[]
   
+  @@index([sessionId])
+  @@index([status])
   @@map("recordings")
 }
 
@@ -153,13 +246,17 @@ model MediaAsset {
   bitrate     Int?       // kbps
   sampleRate  Int?       // Hz (audio)
   resolution  String?    // "1920x1080" (video)
+  codec       String?    // h264, aac, etc.
   
   // Processing metadata
   processedAt DateTime   @default(now())
+  processingTime Int?    // seconds taken to process
   
   recordingId String
   recording   Recording  @relation(fields: [recordingId], references: [id], onDelete: Cascade)
   
+  @@index([recordingId])
+  @@index([type])
   @@map("media_assets")
 }
 
@@ -167,46 +264,64 @@ enum AssetType {
   AUDIO_MP3
   AUDIO_WAV
   AUDIO_AAC
+  AUDIO_FLAC
   VIDEO_MP4
   VIDEO_WEBM
+  VIDEO_HLS
   THUMBNAIL
+  WAVEFORM
+  SUBTITLE_VTT
+  SUBTITLE_SRT
 }
 
-// Final podcast episodes
+// ============================================================================
+// EPISODES & DISTRIBUTION
+// ============================================================================
+
 model Episode {
-  id          String        @id @default(cuid())
-  title       String
-  description String?
+  id            String        @id @default(cuid())
+  title         String
+  description   String?
   episodeNumber Int?
   
   // Episode metadata
-  duration    Int?          // seconds
-  fileSize    BigInt?
-  publishedAt DateTime?
+  duration      Int?          // seconds
+  fileSize      BigInt?
+  publishedAt   DateTime?
   
   // Media files
-  audioUrl    String?       // Final mixed audio
-  videoUrl    String?       // Final mixed video
-  thumbnailUrl String?
+  audioUrl      String?       // Final mixed audio
+  videoUrl      String?       // Final mixed video
+  thumbnailUrl  String?
   
   // AI-generated content
-  showNotes   String?       // Markdown
-  transcript  String?       // Full transcript
-  summary     String?       // AI summary
-  chapters    Json?         // Chapter markers with timestamps
+  showNotes     String?       // Markdown
+  transcript    String?       // Full transcript
+  summary       String?       // AI summary
+  chapters      Json?         // Chapter markers with timestamps
   
   // Distribution
-  status      EpisodeStatus @default(DRAFT)
+  status        EpisodeStatus @default(DRAFT)
   
-  projectId   String
-  project     Project       @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  projectId     String
+  project       Project       @relation(fields: [projectId], references: [id], onDelete: Cascade)
   
-  sessionId   String?
-  session     Session?      @relation(fields: [sessionId], references: [id])
+  sessionId     String?
+  session       Session?      @relation(fields: [sessionId], references: [id])
   
-  createdAt   DateTime      @default(now())
-  updatedAt   DateTime      @updatedAt
+  createdAt     DateTime      @default(now())
+  updatedAt     DateTime      @updatedAt
+  deletedAt     DateTime?     // Soft delete
   
+  // Relations
+  distributions  Distribution[]
+  analytics      EpisodeAnalytics[]
+  processingJobs ProcessingJob[]
+  storageFiles   StorageFile[]
+  
+  @@index([projectId, status])
+  @@index([publishedAt])
+  @@index([sessionId])
   @@map("episodes")
 }
 
@@ -216,55 +331,279 @@ enum EpisodeStatus {
   READY
   PUBLISHED
   ARCHIVED
+  FAILED
 }
 
-// Processing jobs and queue status
+// Platform distribution tracking
+model Distribution {
+  id           String               @id @default(cuid())
+  platform     DistributionPlatform
+  status       DistributionStatus   @default(PENDING)
+  
+  // Platform-specific IDs
+  externalId   String?              // Spotify episode ID, YouTube video ID, etc.
+  platformUrl  String?              // Public URL on platform
+  
+  // Publishing details
+  publishedAt  DateTime?
+  lastSyncAt   DateTime?
+  errorMessage String?
+  retryCount   Int                  @default(0)
+  
+  // Analytics snapshot (cached from platform)
+  views        Int?                 @default(0)
+  downloads    Int?                 @default(0)
+  likes        Int?                 @default(0)
+  
+  episodeId    String
+  episode      Episode              @relation(fields: [episodeId], references: [id], onDelete: Cascade)
+  
+  createdAt    DateTime             @default(now())
+  updatedAt    DateTime             @updatedAt
+  
+  @@unique([episodeId, platform])
+  @@index([episodeId])
+  @@index([platform, status])
+  @@map("distributions")
+}
+
+enum DistributionPlatform {
+  SPOTIFY
+  APPLE_PODCASTS
+  YOUTUBE
+  RSS_FEED
+  GOOGLE_PODCASTS
+  AMAZON_MUSIC
+  SOUNDCLOUD
+}
+
+enum DistributionStatus {
+  PENDING
+  UPLOADING
+  PROCESSING
+  PUBLISHED
+  FAILED
+  UNLISTED
+  REMOVED
+}
+
+// ============================================================================
+// PROCESSING JOBS & QUEUE
+// ============================================================================
+
 model ProcessingJob {
   id          String    @id @default(cuid())
   type        JobType
   status      JobStatus @default(PENDING)
   
   // Job data
-  payload     Json      // Task-specific data
-  result      Json?     // Processing results
-  errorMessage String?
+  payload        Json      // Task-specific data
+  result         Json?     // Processing results
+  errorMessage   String?
+  
+  // FFmpeg-specific tracking
+  inputFileUrl   String?   // Source file URL
+  outputFileUrl  String?   // Result file URL
+  ffmpegCommand  String?   // Actual command executed (for debugging)
+  progress       Float?    @default(0) // 0-100%
+  estimatedTime  Int?      // Seconds remaining
+  
+  // Worker metadata
+  workerId       String?   // Which worker processed this
+  processingNode String?   // K8s pod name or worker hostname
   
   // Queue metadata
-  attempts    Int       @default(0)
-  maxAttempts Int       @default(3)
+  attempts       Int       @default(0)
+  maxAttempts    Int       @default(3)
+  priority       Int       @default(0) // Higher = more priority
   
   // Timing
-  createdAt   DateTime  @default(now())
-  startedAt   DateTime?
-  completedAt DateTime?
+  createdAt      DateTime  @default(now())
+  startedAt      DateTime?
+  completedAt    DateTime?
   
+  // Relations
+  recordingId    String?
+  recording      Recording? @relation(fields: [recordingId], references: [id])
+  
+  episodeId      String?
+  episode        Episode?   @relation(fields: [episodeId], references: [id])
+  
+  @@index([status, type])
+  @@index([createdAt])
+  @@index([recordingId])
+  @@index([episodeId])
+  @@index([priority, status])
   @@map("processing_jobs")
 }
 
 enum JobType {
+  // Media processing
   MEDIA_TRANSCODE
+  MEDIA_NORMALIZE
+  MEDIA_MIX
+  MEDIA_COMPRESS
+  
+  // AI processing
   MEDIA_TRANSCRIBE
   GENERATE_SHOWNOTES
+  GENERATE_CHAPTERS
+  GENERATE_SUMMARY
   GENERATE_THUMBNAIL
+  GENERATE_WAVEFORM
+  
+  // Distribution
   DISTRIBUTE_RSS
   DISTRIBUTE_PLATFORM
+  
+  // Social media
+  GENERATE_SOCIAL_CLIP
+  GENERATE_AUDIOGRAM
 }
 
 enum JobStatus {
   PENDING
+  QUEUED
   RUNNING
   COMPLETED
   FAILED
   RETRYING
+  CANCELLED
 }
 
-// System metrics and analytics
+// ============================================================================
+// FILE STORAGE MANAGEMENT
+// ============================================================================
+
+model StorageFile {
+  id          String   @id @default(cuid())
+  
+  // Storage details
+  bucket      String   // S3 bucket or MinIO bucket
+  key         String   // Object key/path
+  url         String   // Full CDN URL
+  cdnUrl      String?  // CloudFront URL if different
+  
+  // File metadata
+  fileName    String
+  mimeType    String
+  fileSize    BigInt
+  checksum    String?  // MD5/SHA256 for integrity
+  
+  // Lifecycle
+  uploadedAt  DateTime @default(now())
+  expiresAt   DateTime? // For temp files (processing intermediates)
+  deletedAt   DateTime? // Soft delete
+  
+  // Relations (polymorphic)
+  recordingId String?
+  recording   Recording? @relation(fields: [recordingId], references: [id])
+  
+  episodeId   String?
+  episode     Episode?   @relation(fields: [episodeId], references: [id])
+  
+  @@unique([bucket, key])
+  @@index([recordingId])
+  @@index([episodeId])
+  @@index([expiresAt])
+  @@map("storage_files")
+}
+
+// ============================================================================
+// ANALYTICS & METRICS
+// ============================================================================
+
+// Episode performance analytics (daily aggregation)
+model EpisodeAnalytics {
+  id          String   @id @default(cuid())
+  episodeId   String
+  episode     Episode  @relation(fields: [episodeId], references: [id], onDelete: Cascade)
+  
+  // Time dimension
+  date        DateTime @db.Date
+  
+  // Consumption metrics
+  plays           Int      @default(0)
+  downloads       Int      @default(0)
+  uniqueListeners Int      @default(0)
+  
+  // Engagement metrics
+  avgListenDuration Int?   // seconds
+  completionRate    Float? // 0-100%
+  
+  // Platform breakdown (JSON for flexibility)
+  platformBreakdown Json?  // {spotify: 500, apple: 300, youtube: 200}
+  
+  // Geographic data
+  topCountries      Json?  // [{country: "US", plays: 1000}, ...]
+  
+  createdAt DateTime @default(now())
+  
+  @@unique([episodeId, date])
+  @@index([episodeId])
+  @@index([date])
+  @@map("episode_analytics")
+}
+
+// System-level metrics for monitoring
 model SystemMetric {
   id        String   @id @default(cuid())
-  name      String
+  name      String   // "ffmpeg_queue_length", "storage_used_gb", etc.
   value     Float
-  tags      Json?    // Additional labels/dimensions
+  tags      Json?    // {environment: "prod", worker_id: "1"}
   timestamp DateTime @default(now())
   
+  @@index([name, timestamp])
   @@map("system_metrics")
+}
+
+// ============================================================================
+// API INTEGRATIONS & WEBHOOKS
+// ============================================================================
+
+model ApiKey {
+  id          String   @id @default(cuid())
+  name        String   // "Production API", "Mobile App"
+  key         String   @unique // Hashed API key
+  
+  userId      String
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  
+  // Permissions
+  scopes      String[] // ["read:episodes", "write:sessions"]
+  
+  // Usage tracking
+  lastUsedAt  DateTime?
+  usageCount  Int      @default(0)
+  rateLimit   Int      @default(1000) // Requests per hour
+  
+  expiresAt   DateTime?
+  revokedAt   DateTime?
+  
+  createdAt   DateTime @default(now())
+  
+  @@index([userId])
+  @@index([key])
+  @@map("api_keys")
+}
+
+model Webhook {
+  id              String   @id @default(cuid())
+  url             String
+  events          String[] // ["episode.published", "session.ended"]
+  secret          String   // For HMAC signature verification
+  
+  userId          String
+  user            User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  
+  active          Boolean  @default(true)
+  failureCount    Int      @default(0)
+  lastTriggeredAt DateTime?
+  lastFailedAt    DateTime?
+  
+  createdAt       DateTime @default(now())
+  
+  @@index([userId])
+  @@index([active])
+  @@map("webhooks")
 }
